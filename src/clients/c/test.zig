@@ -242,6 +242,167 @@ test "tb_client echo" {
     }
 }
 
+test "tb_client testing state machine" {
+    const RequestContext = RequestContextType(constants.message_body_size_max);
+    const submit = struct {
+        fn run(
+            client: *tb_client.ClientInterface,
+            operation: tb_client.Operation,
+            data: []const u8,
+        ) !RequestContext {
+            var completion = Completion{ .pending = 1 };
+            var request = RequestContext{
+                .packet = undefined,
+                .completion = &completion,
+                .sent_data_size = @intCast(data.len),
+            };
+            stdx.copy_disjoint(.inexact, u8, request.sent_data[0..data.len], data);
+            request.packet = .{
+                .operation = @intFromEnum(operation),
+                .user_data = &request,
+                .data = &request.sent_data,
+                .data_size = request.sent_data_size,
+                .user_tag = 0,
+                .status = .ok,
+            };
+            try client.submit(&request.packet);
+            completion.wait_pending();
+            try testing.expectEqual(tb_client.PacketStatus.ok, request.packet.status);
+            try testing.expect(request.reply != null);
+            return request;
+        }
+    }.run;
+
+    var client: tb_client.ClientInterface = undefined;
+    try tb_client.init_testing(
+        testing.allocator,
+        &client,
+        0,
+        "3000",
+        42,
+        RequestContext.on_complete,
+    );
+    defer client.deinit() catch unreachable;
+
+    const accounts = [_]tb.Account{
+        std.mem.zeroInit(tb.Account, .{ .id = 1, .ledger = 1, .code = 1 }),
+        std.mem.zeroInit(tb.Account, .{ .id = 2, .ledger = 1, .code = 1 }),
+    };
+    const create_accounts = try submit(&client, .create_accounts, std.mem.sliceAsBytes(&accounts));
+    // No results means both accounts were created successfully.
+    try testing.expectEqual(@as(u32, 0), create_accounts.reply.?.result_len);
+
+    const transfers = [_]tb.Transfer{std.mem.zeroInit(tb.Transfer, .{
+        .id = 1,
+        .debit_account_id = 1,
+        .credit_account_id = 2,
+        .amount = 10,
+        .ledger = 1,
+        .code = 1,
+    })};
+    const create_transfers = try submit(
+        &client,
+        .create_transfers,
+        std.mem.sliceAsBytes(&transfers),
+    );
+    try testing.expectEqual(@as(u32, 0), create_transfers.reply.?.result_len);
+
+    const ids = [_]u128{ 1, 2 };
+    const lookup = try submit(&client, .lookup_accounts, std.mem.sliceAsBytes(&ids));
+    try testing.expectEqual(@as(u32, 2 * @sizeOf(tb.Account)), lookup.reply.?.result_len);
+    const result_bytes = lookup.reply.?.result.?[0..lookup.reply.?.result_len];
+    const account_1 = std.mem.bytesToValue(tb.Account, result_bytes[0..@sizeOf(tb.Account)]);
+    const account_2 = std.mem.bytesToValue(tb.Account, result_bytes[@sizeOf(tb.Account)..]);
+    try testing.expectEqual(@as(u128, 10), account_1.debits_posted);
+    try testing.expectEqual(@as(u128, 10), account_2.credits_posted);
+
+    // Reversed scan: account 2 is only ever the credit side, so the debit-side scan is empty.
+    // This exercises `merge_union` when a merged input has fewer than two elements — the case
+    // where a direction inferred from the data (rather than the query) would be wrong.
+    const more_transfers = [_]tb.Transfer{
+        std.mem.zeroInit(tb.Transfer, .{
+            .id = 4,
+            .debit_account_id = 1,
+            .credit_account_id = 2,
+            .amount = 1,
+            .ledger = 1,
+            .code = 1,
+        }),
+        std.mem.zeroInit(tb.Transfer, .{
+            .id = 5,
+            .debit_account_id = 1,
+            .credit_account_id = 2,
+            .amount = 1,
+            .ledger = 1,
+            .code = 1,
+        }),
+    };
+    _ = try submit(&client, .create_transfers, std.mem.sliceAsBytes(&more_transfers));
+
+    const reversed_filter = std.mem.zeroInit(tb.AccountFilter, .{
+        .account_id = 2,
+        .limit = 10,
+        .flags = tb.AccountFilterFlags{ .debits = true, .credits = true, .reversed = true },
+    });
+    const reversed = try submit(
+        &client,
+        .get_account_transfers,
+        std.mem.asBytes(&reversed_filter),
+    );
+    const reversed_transfers = std.mem.bytesAsSlice(
+        tb.Transfer,
+        reversed.reply.?.result.?[0..reversed.reply.?.result_len],
+    );
+    // Newest-first: transfers 1, 4, 5 credited account 2, so a reversed scan yields 5, 4, 1.
+    try testing.expectEqual(@as(usize, 3), reversed_transfers.len);
+    try testing.expectEqual(@as(u128, 5), reversed_transfers[0].id);
+    try testing.expectEqual(@as(u128, 4), reversed_transfers[1].id);
+    try testing.expectEqual(@as(u128, 1), reversed_transfers[2].id);
+    try testing.expect(reversed_transfers[0].timestamp > reversed_transfers[1].timestamp);
+    try testing.expect(reversed_transfers[1].timestamp > reversed_transfers[2].timestamp);
+
+    // Two-phase transfer: pending then post. Exercises the transfers_pending groove and the
+    // `expires_at` index put on create and remove on post.
+    const pending = [_]tb.Transfer{std.mem.zeroInit(tb.Transfer, .{
+        .id = 6,
+        .debit_account_id = 1,
+        .credit_account_id = 2,
+        .amount = 7,
+        .ledger = 1,
+        .code = 1,
+        .timeout = 1000,
+        .flags = tb.TransferFlags{ .pending = true },
+    })};
+    _ = try submit(&client, .create_transfers, std.mem.sliceAsBytes(&pending));
+
+    const after_pending = try submit(&client, .lookup_accounts, std.mem.sliceAsBytes(&[_]u128{1}));
+    const account_pending = std.mem.bytesToValue(
+        tb.Account,
+        after_pending.reply.?.result.?[0..@sizeOf(tb.Account)],
+    );
+    try testing.expectEqual(@as(u128, 7), account_pending.debits_pending);
+    const debits_posted_before = account_pending.debits_posted;
+
+    const post = [_]tb.Transfer{std.mem.zeroInit(tb.Transfer, .{
+        .id = 7,
+        .pending_id = 6,
+        .amount = 7,
+        .ledger = 1,
+        .code = 1,
+        .flags = tb.TransferFlags{ .post_pending_transfer = true },
+    })};
+    const post_result = try submit(&client, .create_transfers, std.mem.sliceAsBytes(&post));
+    try testing.expectEqual(@as(u32, 0), post_result.reply.?.result_len);
+
+    const after_post = try submit(&client, .lookup_accounts, std.mem.sliceAsBytes(&[_]u128{1}));
+    const account_post = std.mem.bytesToValue(
+        tb.Account,
+        after_post.reply.?.result.?[0..@sizeOf(tb.Account)],
+    );
+    try testing.expectEqual(@as(u128, 0), account_post.debits_pending);
+    try testing.expectEqual(debits_posted_before + 7, account_post.debits_posted);
+}
+
 // Asserts the validation rules associated with the `init*` functions.
 test "tb_client init" {
     const assert_status = struct {

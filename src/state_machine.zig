@@ -14,10 +14,21 @@ const vsr = @import("vsr.zig");
 const snapshot_latest = @import("lsm/tree.zig").snapshot_latest;
 const ScopeCloseMode = @import("lsm/tree.zig").ScopeCloseMode;
 const WorkloadType = @import("state_machine/workload.zig").WorkloadType;
-const GrooveType = @import("lsm/groove.zig").GrooveType;
-const ForestType = @import("lsm/forest.zig").ForestType;
 const ScanBuffer = @import("lsm/scan_buffer.zig").ScanBuffer;
-const ScanLookupType = @import("lsm/scan_lookup.zig").ScanLookupType;
+
+// The state machine is generic over a `Backend` that provides the LSM types it stores its
+// objects in. `LSMBackend` is the production backend; `src/testing/memory_forest.zig` provides an
+// in-memory backend for the lightweight in-process test client. Backend-invariant value types
+// (e.g. `EvaluateNext`, `ScanLookupStatus`) are imported directly rather than routed through the
+// backend, so a backend only needs to supply the type constructors that actually differ.
+const LSMBackend = struct {
+    pub const GridType = @import("vsr/grid.zig").GridType;
+    pub const GrooveType = @import("lsm/groove.zig").GrooveType;
+    pub const ScanLookupType = @import("lsm/scan_lookup.zig").ScanLookupType;
+    pub const ScanRangeType = @import("lsm/scan_range.zig").ScanRangeType;
+    pub const ScanTreeType = @import("lsm/scan_tree.zig").ScanTreeType;
+    pub const ForestType = @import("lsm/forest.zig").ForestType;
+};
 
 const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
 const MultiBatchDecoder = vsr.multi_batch.MultiBatchDecoder;
@@ -96,13 +107,21 @@ pub fn StateMachineType(
     comptime Storage: type,
     comptime config: constants.StateMachineConfig,
 ) type {
+    return StateMachineWithBackendType(Storage, config, LSMBackend);
+}
+
+pub fn StateMachineWithBackendType(
+    comptime Storage: type,
+    comptime config: constants.StateMachineConfig,
+    comptime Backend: type,
+) type {
     assert(config.message_body_size_max > 0);
     assert(config.lsm_compaction_ops > 0);
     assert(constants.vsr_operations_reserved > 0);
 
     return struct {
         const StateMachine = @This();
-        const Grid = @import("vsr/grid.zig").GridType(Storage);
+        const Grid = Backend.GridType(Storage);
         pub const Operation = tb.Operation;
 
         pub const machine_constants = struct {
@@ -149,7 +168,7 @@ pub fn StateMachineType(
 
         const tree_values_count_max = tree_values_count(config.message_body_size_max);
 
-        const AccountsGroove = GrooveType(
+        const AccountsGroove = Backend.GrooveType(
             Storage,
             Account,
             .{
@@ -185,7 +204,7 @@ pub fn StateMachineType(
             },
         );
 
-        const TransfersGroove = GrooveType(
+        const TransfersGroove = Backend.GrooveType(
             Storage,
             Transfer,
             .{
@@ -227,7 +246,7 @@ pub fn StateMachineType(
             },
         );
 
-        const TransfersPendingGroove = GrooveType(
+        const TransfersPendingGroove = Backend.GrooveType(
             Storage,
             TransferPending,
             .{
@@ -259,7 +278,7 @@ pub fn StateMachineType(
             }
         };
 
-        const AccountEventsGroove = GrooveType(
+        const AccountEventsGroove = Backend.GrooveType(
             Storage,
             AccountEvent,
             .{
@@ -492,33 +511,37 @@ pub fn StateMachineType(
 
         pub const Workload = WorkloadType(StateMachine);
 
-        pub const Forest = ForestType(Storage, .{
+        pub const Forest = Backend.ForestType(Storage, .{
             .accounts = AccountsGroove,
             .transfers = TransfersGroove,
             .transfers_pending = TransfersPendingGroove,
             .account_events = AccountEventsGroove,
         });
 
-        const AccountsScanLookup = ScanLookupType(
+        const AccountsScanLookup = Backend.ScanLookupType(
             AccountsGroove,
             AccountsGroove.ScanBuilder.Scan,
             Storage,
         );
 
-        const TransfersScanLookup = ScanLookupType(
+        const TransfersScanLookup = Backend.ScanLookupType(
             TransfersGroove,
             TransfersGroove.ScanBuilder.Scan,
             Storage,
         );
 
-        const AccountBalancesScanLookup = ScanLookupType(
+        const AccountBalancesScanLookup = Backend.ScanLookupType(
             AccountEventsGroove,
             // Both Objects use the same timestamp, so we can use the TransfersGroove's indexes.
             TransfersGroove.ScanBuilder.Scan,
             Storage,
         );
 
-        const ChangeEventsScanLookup = ChangeEventsScanLookupType(AccountEventsGroove, Storage);
+        const ChangeEventsScanLookup = ChangeEventsScanLookupType(
+            AccountEventsGroove,
+            Storage,
+            Backend,
+        );
 
         pub fn operation_from_vsr(operation: vsr.Operation) ?Operation {
             if (operation == .pulse) return .pulse;
@@ -838,7 +861,8 @@ pub fn StateMachineType(
             }
         };
 
-        const ExpirePendingTransfers = ExpirePendingTransfersType(TransfersGroove, Storage);
+        const ExpirePendingTransfers =
+            ExpirePendingTransfersType(TransfersGroove, Storage, Backend);
 
         /// Since scan lookups are used one at a time, it's safe to access
         /// the union's fields and reuse the same memory for all ScanLookup instances.
@@ -4878,10 +4902,10 @@ pub fn StateMachineType(
 fn ExpirePendingTransfersType(
     comptime TransfersGroove: type,
     comptime Storage: type,
+    comptime Backend: type,
 ) type {
     return struct {
         const ExpirePendingTransfers = @This();
-        const ScanRangeType = @import("lsm/scan_range.zig").ScanRangeType;
         const EvaluateNext = @import("lsm/scan_range.zig").EvaluateNext;
         const ScanLookupStatus = @import("lsm/scan_lookup.zig").ScanLookupStatus;
 
@@ -4891,7 +4915,7 @@ fn ExpirePendingTransfersType(
         // TODO(zig) Context should be `*ExpirePendingTransfers`,
         // but its a dependency loop.
         const Context = struct {};
-        const ScanRange = ScanRangeType(
+        const ScanRange = Backend.ScanRangeType(
             Tree,
             Storage,
             *Context,
@@ -4899,7 +4923,7 @@ fn ExpirePendingTransfersType(
             timestamp_from_value,
         );
 
-        pub const ScanLookup = ScanLookupType(
+        pub const ScanLookup = Backend.ScanLookupType(
             TransfersGroove,
             ScanRange,
             Storage,
@@ -5035,13 +5059,12 @@ fn ExpirePendingTransfersType(
 fn ChangeEventsScanLookupType(
     comptime AccountEventsGroove: type,
     comptime Storage: type,
+    comptime Backend: type,
 ) type {
-    const ScanTreeType = @import("lsm/scan_tree.zig").ScanTreeType;
-
     return struct {
         const AccountEventsLookup = @This();
         const AccountEvent = AccountEventsGroove.ObjectTree.Table.Value;
-        const ScanTree = ScanTreeType(
+        const ScanTree = Backend.ScanTreeType(
             void,
             AccountEventsGroove.ObjectTree,
             Storage,
@@ -5163,4 +5186,14 @@ fn sum_overflows_test(comptime Int: type) !void {
 test "sum_overflows" {
     try sum_overflows_test(u64);
     try sum_overflows_test(u128);
+}
+
+test "hashmap-backed state machine compiles" {
+    const MemoryBackend = @import("testing/memory_forest.zig").Backend;
+    const MemoryStateMachine = StateMachineWithBackendType(
+        void,
+        constants.state_machine_config,
+        MemoryBackend,
+    );
+    _ = @sizeOf(MemoryStateMachine);
 }
