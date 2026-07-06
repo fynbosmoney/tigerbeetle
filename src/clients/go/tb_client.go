@@ -74,6 +74,24 @@ func NewClient(
 	clusterID types.Uint128,
 	addresses []string,
 ) (Client, error) {
+	return newClient(clusterID, addresses, false)
+}
+
+// NewTestingClient creates a client backed by an in-process state machine with an in-memory
+// store: no networking, consensus, or persistence. Intended for tests. The addresses argument
+// is ignored (but must be syntactically valid, e.g. "3000").
+func NewTestingClient(
+	clusterID types.Uint128,
+	addresses []string,
+) (Client, error) {
+	return newClient(clusterID, addresses, true)
+}
+
+func newClient(
+	clusterID types.Uint128,
+	addresses []string,
+	testing bool,
+) (Client, error) {
 	// Allocate a cstring of the addresses joined with ",".
 	addresses_raw := strings.Join(addresses[:], ",")
 	c_addresses := C.CString(addresses_raw)
@@ -83,14 +101,26 @@ func NewClient(
 	var cluster_id = C.tb_uint128_t(clusterID)
 
 	// Create the tb_client.
-	init_status := C.tb_client_init(
-		tb_client,
-		(*C.uint8_t)(unsafe.Pointer(&cluster_id)),
-		c_addresses,
-		C.uint32_t(len(addresses_raw)),
-		C.uintptr_t(0), // on_completion_ctx
-		(*[0]byte)(C.onGoPacketCompletion),
-	)
+	var init_status C.TB_INIT_STATUS
+	if testing {
+		init_status = C.tb_client_init_testing(
+			tb_client,
+			(*C.uint8_t)(unsafe.Pointer(&cluster_id)),
+			c_addresses,
+			C.uint32_t(len(addresses_raw)),
+			C.uintptr_t(0), // on_completion_ctx
+			(*[0]byte)(C.onGoPacketCompletion),
+		)
+	} else {
+		init_status = C.tb_client_init(
+			tb_client,
+			(*C.uint8_t)(unsafe.Pointer(&cluster_id)),
+			c_addresses,
+			C.uint32_t(len(addresses_raw)),
+			C.uintptr_t(0), // on_completion_ctx
+			(*[0]byte)(C.onGoPacketCompletion),
+		)
+	}
 
 	if init_status != C.TB_INIT_SUCCESS {
 		switch init_status {
